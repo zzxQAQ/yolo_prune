@@ -1,0 +1,10 @@
+
+
+# 数据集路径
+train: /home/zhengxiuzhang/ultralytics-main/coco-person/images/train2017
+# 验证集的相对路径，这里是 path 路径下的 images/val 目录，包含4张验证用图片。
+val: /home/zhengxiuzhang/ultralytics-main/coco-person/images/val2017
+
+# 数据集类别
+nc: 1  # 类别总数
+names: ["person"]
