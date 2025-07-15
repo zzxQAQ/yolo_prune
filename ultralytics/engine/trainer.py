@@ -56,7 +56,7 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
 )
 
-from wanda_pp.prune import WandaPlusElementwiseScorer,save_pruned_model,apply_mask_to_model_weights,prune_by_weight_magnitude_groupwise_64,update_masks_and_clear_scorer,apply_mask_to_grads_and_state,adjust_phase_lr
+from wanda_pp.prune import WandaPlusElementwiseScorer,save_pruned_model,apply_mask_to_model_weights,prune_by_weight_magnitude_groupwise_64,update_masks_and_clear_scorer,apply_mask_to_grads_and_state,adjust_phase_lr,adjust_phase_lr_v2,update_masks_groupwise_64_v2
 class BaseTrainer:
     """
     A base class for creating trainers.
@@ -385,7 +385,7 @@ class BaseTrainer:
                 self.scheduler.step()
 
             # ——— 自定义分阶段学习率调整 ———
-            adjust_phase_lr(epoch, optimizer=self.optimizer)
+            adjust_phase_lr_v2(epoch, optimizer=self.optimizer)
             print(self.optimizer.param_groups[0]['lr'],'============')
             self._model_train()
             if RANK != -1:
@@ -401,6 +401,9 @@ class BaseTrainer:
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
             # masks = prune_by_scores(self.model.module, prune_ratio=sparsity, unit_size=64, existing_masks_dict=previous_masks_dict)
+            # import pickle
+            # with open('onetime_masks.pkl', 'rb') as f:
+            #     masks = pickle.load(f)
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
@@ -415,8 +418,8 @@ class BaseTrainer:
                         )
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
-                if epoch > 5:
                     # 应用mask
+                if epoch > 5:
                     apply_mask_to_model_weights(self.model.module, masks)
                     previous_masks_dict = masks
                 # Forward
@@ -470,6 +473,37 @@ class BaseTrainer:
             # 更新mask，并清除scorer
             if self.args.prune_method == 'wanda':
                 masks = update_masks_and_clear_scorer(self, scorer, start_epoch, end_epoch, final_sparsity, previous_masks_dict)
+                # import pickle
+                # with open('onetime_masks.pkl', 'rb') as f:
+                #     masks = pickle.load(f)
+            elif self.args.prune_method == 'wanda_onetime':
+                # 一次性剪枝版本
+                # 预热结束，执行一次性剪枝
+                scores_dict = scorer.compute_final_scores()
+                saved_onetime_masks = update_masks_groupwise_64_v2(
+                    self.model.module,
+                    scores_dict,
+                    epoch,
+                    target_sparsity=final_sparsity
+                )
+                print(f"Epoch {epoch}: 一次性剪枝完成，保存掩码用于后续epoch")
+                
+                # 保存mask到文件
+                import pickle
+                import os
+                mask_save_path = os.path.join(self.save_dir, 'onetime_masks.pkl')
+                with open(mask_save_path, 'wb') as f:
+                    pickle.dump(saved_onetime_masks, f)
+                print(f"掩码已保存到: {mask_save_path}")
+                
+                # 清理scorer，节省内存并停止累积
+                scorer.remove_hooks()  # 移除hooks，停止累积
+                scorer.scores_sum.clear()
+                scorer.forward_acts_sum.clear()
+                scorer.forward_acts_count.clear()
+                print("Scorer已清理，停止得分累积")
+            
+                break
             else:
                 masks = prune_by_weight_magnitude_groupwise_64(
                     self.model.module,
@@ -523,7 +557,7 @@ class BaseTrainer:
         # 保存剪枝后的模型
         if self.args.prune_method == 'wanda':
             ema_model = self.ema.ema if self.ema else None
-            save_pruned_model(self.model.module, masks, 'schedule+wanda++_all_layer_yolov8s_pruned_state.pt', ema_model)
+            save_pruned_model(self.model.module, masks, '1e-3-0.75_schedule+wanda++_all_layer_yolov8s_pruned_state.pt', ema_model)
         else:
             ema_model = self.ema.ema if self.ema else None
             save_pruned_model(self.model.module, masks, 'schedule+weight_magnitude_all_layer_yolov8s_pruned_state.pt', ema_model)

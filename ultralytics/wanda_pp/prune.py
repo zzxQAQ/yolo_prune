@@ -106,10 +106,13 @@ def apply_mask_to_model_weights(model, masks_dict):
     参数：
         model: 你的YOLOv8模型
         masks_dict: dict，键是层名，值是掩码Tensor，形状和对应权重相同，元素是0/1
+                   如果为None，则跳过掩码应用
     
     说明：
         只对model里存在且在masks_dict中的卷积层权重应用掩码。
     """
+    if masks_dict is None:
+        return
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Conv2d):
             if name in masks_dict:
@@ -274,17 +277,64 @@ def update_masks_groupwise_64(model, scores_dict, epoch, start_epoch, end_epoch,
     返回:
         masks_dict: 当前epoch掩码字典 {层名: mask_tensor}
     """
-    # 没到间隔就直接复用旧 mask
+    # -------- 预热阶段：不进行剪枝 --------
+    WARMUP_EPOCHS = 5  # 预热epoch数
+    TOTAL_EPOCHS = 100  # 训练总 epoch，若不同可按需修改
+    STAGE_COUNT = 3
+    
+    if epoch < WARMUP_EPOCHS:
+        # 预热期间不剪枝，返回全1掩码或保持现有掩码
+        if existing_masks_dict is not None:
+            return existing_masks_dict
+        else:
+            # 创建全1掩码
+            masks_dict = {}
+            for name, module in model.named_modules():
+                if isinstance(module, nn.Conv2d):
+                    masks_dict[name] = torch.ones_like(module.weight)
+            return masks_dict
 
-    # 使用三次方公式平滑递增稀疏率
-    # s_t = s_f + (s_i - s_f) * (1 - progress)^3
-    current_sparsity = compute_current_sparsity_paper(
-        epoch,
-        start_epoch,
-        end_epoch,
-        final_sparsity,
-    )
-    print(current_sparsity,'================')
+    # -------- 多阶段非线性稀疏率调度（阶段平均分配） --------
+    # 调整后的阶段计算（减去预热期）
+    adjusted_epoch = epoch - WARMUP_EPOCHS
+    adjusted_total = TOTAL_EPOCHS - WARMUP_EPOCHS
+    STAGE_LENGTH = adjusted_total // STAGE_COUNT  # ≈31
+
+    stage_targets = [0.5, 0.65, 0.75]  # 各阶段目标稀疏率
+
+    # 计算当前所处阶段 idx (0,1,2)
+    stage_idx = min(adjusted_epoch // STAGE_LENGTH, STAGE_COUNT - 1)
+    stage_start = stage_idx * STAGE_LENGTH + WARMUP_EPOCHS  # 加回预热期
+    # 处理最后一个阶段长度可能略长的情况
+    if stage_idx == STAGE_COUNT - 1:
+        stage_end = TOTAL_EPOCHS
+    else:
+        stage_end = stage_start + STAGE_LENGTH
+
+    ramp_len = int((stage_end - stage_start) * 0.7)  # 前 80% 用于过渡
+    ramp_end = stage_start + ramp_len
+
+    prev_target = 0.0 if stage_idx == 0 else stage_targets[stage_idx - 1]
+    target_sparsity = stage_targets[stage_idx]
+
+    # 根据所在位置计算 current_sparsity
+    if epoch < ramp_end:
+        current_sparsity = compute_current_sparsity_paper(
+            epoch=epoch,
+            start_epoch=stage_start,
+            end_epoch=ramp_end,
+            final_sparsity=target_sparsity,
+            initial_sparsity=prev_target,
+        )
+    else:
+        current_sparsity = target_sparsity
+
+    print(f"Epoch {epoch}: sparsity {current_sparsity} (stage {stage_idx + 1})")
+
+    # -------- 锁定阶段：若位于阶段后 20%，保持前一轮掩码 --------
+    if epoch >= ramp_end and existing_masks_dict is not None:
+        return existing_masks_dict
+
     masks_dict = {}
 
     unit_size = 64
@@ -338,6 +388,78 @@ def update_masks_groupwise_64(model, scores_dict, epoch, start_epoch, end_epoch,
 
     return masks_dict
 
+def update_masks_groupwise_64_v2(model, scores_dict, epoch, target_sparsity=0.75):
+    """
+    Wanda++ group-wise 64元素剪枝（一次性剪枝版本）
+    
+    在预热期结束后（第5个epoch），一次性剪枝到目标稀疏率，
+    后续epoch直接复用该掩码，不再重新计算。
+
+    参数:
+        model: PyTorch模型
+        scores_dict: 得分字典
+        epoch: 当前训练epoch
+        target_sparsity: 目标稀疏率，默认0.75
+
+    返回:
+        masks_dict: 掩码字典 {层名: mask_tensor}，或None（预热期）
+    """
+    
+    print(f"Epoch {epoch}: 执行一次性剪枝，目标稀疏率 {target_sparsity}")
+    
+    masks_dict = {}
+    unit_size = 64
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d) and name in scores_dict:
+            score = scores_dict[name].to(module.weight.device)
+            weight = module.weight.data
+
+            flat_score = score.view(-1)
+            num_units = flat_score.numel() // unit_size
+
+            if num_units == 0:
+                # 权重数量不足一组，跳过剪枝
+                masks_dict[name] = torch.ones_like(score)
+                continue
+
+            flat_score = flat_score[:num_units * unit_size]  # 截断
+            grouped_score = flat_score.view(num_units, unit_size).mean(dim=1)
+
+            # 计算需要保留的组数
+            k = max(1, int((1 - target_sparsity) * num_units))
+            
+            if k >= num_units:
+                # 保留所有组
+                group_mask = torch.ones_like(grouped_score)
+            else:
+                # top-k组保留
+                topk_val, _ = torch.topk(grouped_score, k, sorted=False)
+                threshold = topk_val[-1]
+                group_mask = (grouped_score >= threshold).float()
+
+            # 展开mask至每个元素
+            group_mask = group_mask.view(-1, 1).expand(-1, unit_size)
+
+            # 处理尾部剩余元素（如果存在）
+            tail = score.numel() % unit_size
+            if tail > 0:
+                tail_mask = torch.ones(tail, device=score.device)
+                full_mask = torch.cat([group_mask.reshape(-1), tail_mask], dim=0)
+            else:
+                full_mask = group_mask.reshape(-1)
+
+            full_mask = full_mask.view_as(score)
+            masks_dict[name] = full_mask
+            
+            # 统计剪枝结果
+            kept = full_mask.sum().item()
+            total = full_mask.numel()
+            actual_sparsity = 1 - kept / total
+            print(f"[{name}] 总参数:{total}, 保留:{kept}, 实际稀疏率:{actual_sparsity:.3f}")
+
+    return masks_dict
+
 def apply_mask_to_grads_and_state(optimizer, masks_dict):
     """在 optimizer.step() 前屏蔽已剪枝权重的梯度和动量。
 
@@ -345,7 +467,13 @@ def apply_mask_to_grads_and_state(optimizer, masks_dict):
 
     1. 先用参数对象本身作为 key（推荐：构造 masks_dict 时直接用 param）
     2. 再退回旧版的 name 键，保证向后兼容
+    
+    参数：
+        optimizer: 优化器
+        masks_dict: 掩码字典，如果为None则跳过处理
     """
+    if masks_dict is None:
+        return
 
     for group in optimizer.param_groups:
         for p in group["params"]:
@@ -502,9 +630,9 @@ def adjust_phase_lr(
         optimizer,
         total_epochs: int = 100,      # 训练总 epoch
         prune_epochs: int = 70,       # 剪枝期（含微调）长度
-        plateau_lr: float = 1e-3,     # 初始 LR（剪枝初期）
-        ft_peak_lr: float = 1e-4,     # 微调起始 LR（剪枝后期末）
-        ft_min_lr: float = 1e-5,      # 微调最低 LR
+        plateau_lr: float = 2e-3,     # 初始 LR（剪枝初期）
+        ft_peak_lr: float = 7e-4,     # 微调起始 LR（剪枝后期末）
+        ft_min_lr: float = 1e-4,      # 微调最低 LR
 ):
     """
     新策略：
@@ -520,6 +648,69 @@ def adjust_phase_lr(
         # 阶段2：微调阶段，余弦退火
         progress = (epoch - prune_epochs) / max(1, total_epochs - prune_epochs)
         lr = ft_min_lr + 0.5 * (ft_peak_lr - ft_min_lr) * (1 + math.cos(math.pi * progress))
+
+    for pg in optimizer.param_groups:
+        pg["lr"] = lr
+
+def adjust_phase_lr_v2(
+    epoch: int,
+    optimizer,
+    *,
+    total_epochs: int = 100,
+    warmup_epochs: int = 5,
+    stage_count: int = 3,
+    base_batch: int = 8,
+    current_batch: int = 32,
+    base_lr: float = 1e-3,
+    min_lr: float = 1e-5,
+):
+    """
+    多阶段学习率策略（批量缩放版，配合分段剪枝）
+
+    1. **预热阶段（前5个epoch）**：学习率从0线性上升到plateau_lr
+    2. **每个剪枝阶段（3段）**：
+       - 阶段内前80%：学习率保持常数plateau_lr
+       - 阶段内后20%：学习率从plateau_lr线性衰减到ft_min_lr
+
+    按 *线性缩放原则*：`lr ∝ batch_size / base_batch`。
+    """
+
+    # 计算缩放后的学习率上下限
+    scale = current_batch / base_batch
+    plateau_lr = base_lr * scale       
+    ft_min_lr = min_lr * scale         
+
+    # 基础参数计算
+    stage_length = (total_epochs - warmup_epochs) // stage_count
+    
+    if epoch < warmup_epochs:
+        # 1. 预热阶段：线性增加到plateau_lr
+        progress = epoch / warmup_epochs
+        lr = progress * plateau_lr
+        
+    else:
+        # 2. 确定当前所处阶段
+        adjusted_epoch = epoch - warmup_epochs
+        stage_idx = min(adjusted_epoch // stage_length, stage_count - 1)
+        stage_start = stage_idx * stage_length + warmup_epochs
+        
+        # 处理最后一个阶段可能略长的情况
+        if stage_idx == stage_count - 1:
+            stage_end = total_epochs
+        else:
+            stage_end = stage_start + stage_length
+            
+        # 计算阶段内80%位置
+        ramp_len = int((stage_end - stage_start) * 0.7)
+        ramp_end = stage_start + ramp_len
+        
+        if epoch < ramp_end:
+            # 阶段内前80%：保持恒定plateau_lr
+            lr = plateau_lr
+        else:
+            # 阶段内后20%：线性衰减到最小学习率
+            decay_progress = (epoch - ramp_end) / (stage_end - ramp_end)
+            lr = plateau_lr - (plateau_lr - ft_min_lr) * decay_progress
 
     for pg in optimizer.param_groups:
         pg["lr"] = lr
