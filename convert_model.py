@@ -40,4 +40,4 @@ def save_metrics(csv_path, target_layer, metrics):
         if not file_exists:
             writer.writerow(['layer'] + selected_keys)
         writer.writerow([target_layer] + selected_values)
-convert('/home/zhengxiuzhang/ultralytics-main/pruned_model/onetime_schedule+wanda++_all_layer_yolov8s_pruned_state.pt')
+convert('/home/zhengxiuzhang/ultralytics-main/pruned_model/7-16-schedule+weight_magnitude_all_layer_yolov8s_pruned_state.pt')

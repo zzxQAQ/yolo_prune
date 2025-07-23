@@ -56,7 +56,7 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
 )
 
-from wanda_pp.prune import WandaPlusElementwiseScorer,save_pruned_model,apply_mask_to_model_weights,prune_by_weight_magnitude_groupwise_64,update_masks_and_clear_scorer,apply_mask_to_grads_and_state,adjust_phase_lr,adjust_phase_lr_v2,update_masks_groupwise_64_v2
+from wanda_pp.prune import adjust_lr_by_step,WandaPlusElementwiseScorer,apply_mask_to_model_weights,update_masks_and_clear_scorer,reset_optimizer_state_for_pruned_weights
 class BaseTrainer:
     """
     A base class for creating trainers.
@@ -372,11 +372,12 @@ class BaseTrainer:
         scorer = WandaPlusElementwiseScorer(self.model.module, alpha=100, device='cuda')
         scorer.register_hooks()
         previous_masks_dict = None
-        start_epoch = 5
-        end_epoch = 70
-        final_sparsity = 0.75 
+        total_steps = self.epochs * len(self.train_loader)
+        prune_steps = int(total_steps * 0.8)  # 前80%为剪枝阶段
+        prune_fre = self.args.prune_fre  # 每100步更新一次mask
+        final_sparsity = self.args.prune_final_sparsity  # 你的最终稀疏率
         masks = None
-
+        global_step = 0
         while True:
             self.epoch = epoch
             self.run_callbacks("on_train_epoch_start")
@@ -384,9 +385,6 @@ class BaseTrainer:
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
                 self.scheduler.step()
 
-            # ——— 自定义分阶段学习率调整 ———
-            adjust_phase_lr_v2(epoch, optimizer=self.optimizer)
-            print(self.optimizer.param_groups[0]['lr'],'============')
             self._model_train()
             if RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
@@ -401,10 +399,10 @@ class BaseTrainer:
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
             # masks = prune_by_scores(self.model.module, prune_ratio=sparsity, unit_size=64, existing_masks_dict=previous_masks_dict)
-            # import pickle
-            # with open('onetime_masks.pkl', 'rb') as f:
-            #     masks = pickle.load(f)
             for i, batch in pbar:
+                adjust_lr_by_step(self.batch_size,global_step, self.optimizer, total_steps,self.args.prune_lr0,self.args.prune_lrf)
+                if global_step % 100 == 0:
+                    print(self.optimizer.param_groups[0]['lr'],'============')
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
                 ni = i + nb * epoch
@@ -419,9 +417,8 @@ class BaseTrainer:
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
                     # 应用mask
-                if epoch > 5:
-                    apply_mask_to_model_weights(self.model.module, masks)
-                    previous_masks_dict = masks
+                apply_mask_to_model_weights(self.model.module, masks)
+                previous_masks_dict = masks
                 # Forward
                 batch = self.preprocess_batch(batch)
                 loss, self.loss_items = self.model(batch)
@@ -437,8 +434,7 @@ class BaseTrainer:
                 scorer.accumulate_batch_scores()
                 # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
                 if ni - last_opt_step >= self.accumulate:
-                    if epoch>5:
-                        apply_mask_to_grads_and_state(self.optimizer, masks)
+                    reset_optimizer_state_for_pruned_weights(self.optimizer, masks)
                     self.optimizer_step()
                     last_opt_step = ni
 
@@ -470,49 +466,13 @@ class BaseTrainer:
 
 
                 self.run_callbacks("on_train_batch_end")
-            # 更新mask，并清除scorer
-            if self.args.prune_method == 'wanda':
-                masks = update_masks_and_clear_scorer(self, scorer, start_epoch, end_epoch, final_sparsity, previous_masks_dict)
-                # import pickle
-                # with open('onetime_masks.pkl', 'rb') as f:
-                #     masks = pickle.load(f)
-            elif self.args.prune_method == 'wanda_onetime':
-                # 一次性剪枝版本
-                # 预热结束，执行一次性剪枝
-                scores_dict = scorer.compute_final_scores()
-                saved_onetime_masks = update_masks_groupwise_64_v2(
-                    self.model.module,
-                    scores_dict,
-                    epoch,
-                    target_sparsity=final_sparsity
-                )
-                print(f"Epoch {epoch}: 一次性剪枝完成，保存掩码用于后续epoch")
-                
-                # 保存mask到文件
-                import pickle
-                import os
-                mask_save_path = os.path.join(self.save_dir, 'onetime_masks.pkl')
-                with open(mask_save_path, 'wb') as f:
-                    pickle.dump(saved_onetime_masks, f)
-                print(f"掩码已保存到: {mask_save_path}")
-                
-                # 清理scorer，节省内存并停止累积
-                scorer.remove_hooks()  # 移除hooks，停止累积
-                scorer.scores_sum.clear()
-                scorer.forward_acts_sum.clear()
-                scorer.forward_acts_count.clear()
-                print("Scorer已清理，停止得分累积")
+                # 更新mask，并清除scorer
+                masks = update_masks_and_clear_scorer(self, scorer, global_step, total_steps, prune_steps, final_sparsity, previous_masks_dict, prune_fre=prune_fre)
+                global_step = global_step + 1
             
-                break
-            else:
-                masks = prune_by_weight_magnitude_groupwise_64(
-                    self.model.module,
-                    epoch=epoch,
-                    start_epoch=start_epoch,
-                    end_epoch=end_epoch,
-                    final_sparsity=final_sparsity,
-                    existing_masks_dict=previous_masks_dict,
-                )
+                # 保存当前masks到实例变量，供EMA更新使用
+                self.masks = masks
+            
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             self.run_callbacks("on_train_epoch_end")
             if RANK in {-1, 0}:
@@ -554,13 +514,6 @@ class BaseTrainer:
             if self.stop:
                 break  # must break all DDP ranks
             epoch += 1
-        # 保存剪枝后的模型
-        if self.args.prune_method == 'wanda':
-            ema_model = self.ema.ema if self.ema else None
-            save_pruned_model(self.model.module, masks, '1e-3-0.75_schedule+wanda++_all_layer_yolov8s_pruned_state.pt', ema_model)
-        else:
-            ema_model = self.ema.ema if self.ema else None
-            save_pruned_model(self.model.module, masks, 'schedule+weight_magnitude_all_layer_yolov8s_pruned_state.pt', ema_model)
         if RANK in {-1, 0}:
             # Do final val with best.pt
             seconds = time.time() - self.train_time_start
@@ -624,6 +577,8 @@ class BaseTrainer:
         """Save model training checkpoints with additional metadata."""
         import io
 
+        # 准备EMA模型，已经在验证前应用了稀疏化mask
+        ema_model = deepcopy(self.ema.ema).half()
         # Serialize ckpt to a byte buffer once (faster than repeated torch.save() calls)
         buffer = io.BytesIO()
         torch.save(
@@ -631,7 +586,7 @@ class BaseTrainer:
                 "epoch": self.epoch,
                 "best_fitness": self.best_fitness,
                 "model": None,  # resume and final checkpoints derive from EMA
-                "ema": deepcopy(self.ema.ema).half(),
+                "ema": ema_model,  # 使用稀疏化的EMA模型
                 "updates": self.ema.updates,
                 "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
                 "train_args": vars(self.args),  # save as dict
@@ -711,6 +666,9 @@ class BaseTrainer:
         self.optimizer.zero_grad()
         if self.ema:
             self.ema.update(self.model)
+            # 在EMA更新后重新应用剪枝
+            if hasattr(self, 'masks') and self.masks is not None:
+                apply_mask_to_model_weights(self.ema.ema, self.masks)
 
     def preprocess_batch(self, batch):
         """Allow custom preprocessing model inputs and ground truths depending on task type."""

@@ -123,350 +123,22 @@ def apply_mask_to_model_weights(model, masks_dict):
                 # print(f"[{name}] 权重置零完成")
 
 
-def prune_by_scores(scores_dict, prune_ratio=0.5, unit_size=64, existing_masks_dict=None):
-    """
-    基于得分分组剪枝，支持已有掩码基础上继续剪到目标稀疏率。
 
-    参数：
-        scores_dict: dict[layer_name] = score_tensor，形状与权重相同
-        prune_ratio: float，目标总稀疏率（包含已有为0的位置）
-        unit_size: int，每组多少个元素（连续切片大小）
-        existing_masks_dict: dict[layer_name] = mask_tensor（已有的剪枝掩码）
-
-    返回：
-        masks_dict: dict[layer_name] = 新的掩码Tensor，和权重形状相同
-    """
-    masks_dict = {}
-
-    for layer_name, score_tensor in scores_dict.items():
-        total_weights = score_tensor.numel()
-        if total_weights < unit_size:
-            # 太小的层直接全保留
-            masks_dict[layer_name] = torch.ones_like(score_tensor)
-            print(f"[{layer_name}] 权重数 {total_weights} < {unit_size}, 不剪枝")
-            continue
-
-        score_flat = score_tensor.view(-1)
-        # 初始掩码全部为1
-        if existing_masks_dict is not None and layer_name in existing_masks_dict:
-            mask_flat = existing_masks_dict[layer_name].view(-1).clone()
-        else:
-            mask_flat = torch.ones_like(score_flat)
-
-        # 已剪掉的权重数
-        num_already_zero = (mask_flat == 0).sum().item()
-
-        # 目标剪枝总数
-        total_prune_num = int(total_weights * prune_ratio)
-        remaining_prune_num = max(total_prune_num - num_already_zero, 0)
-
-        if remaining_prune_num == 0:
-            # 已达到目标剪枝率，无需再剪
-            masks_dict[layer_name] = mask_flat.view(score_tensor.shape)
-            continue
-
-        # 分组数量（不够整除最后一组可能小于unit_size）
-        num_groups = (total_weights + unit_size - 1) // unit_size
-
-        # 均分剪枝数量
-        base_per_group = remaining_prune_num // num_groups
-        remainder = remaining_prune_num % num_groups
-
-        for g in range(num_groups):
-            start = g * unit_size
-            end = min(start + unit_size, total_weights)
-
-            group_scores = score_flat[start:end]
-            group_mask = mask_flat[start:end]
-
-            valid_indices = torch.nonzero(group_mask == 1, as_tuple=True)[0]
-            num_valid = valid_indices.numel()
-
-            prune_in_group = base_per_group + (1 if g < remainder else 0)
-            prune_in_group = min(prune_in_group, num_valid)
-
-            if prune_in_group > 0 and num_valid > 0:
-                valid_scores = group_scores[valid_indices]
-                to_prune = torch.topk(valid_scores, prune_in_group, largest=False).indices
-                prune_indices = valid_indices[to_prune]
-
-                # 通过索引直接修改原掩码
-                indices_in_mask_flat = start + prune_indices
-                mask_flat[indices_in_mask_flat] = 0
-
-        masks_dict[layer_name] = mask_flat.view(score_tensor.shape)
-
-    return masks_dict
-
-def prune_single_layer_by_score(scores_dict, target_layer, prune_ratio=0.5, unit_size=64):
-    """
-    只对目标层做剪枝，其余层不剪。
-    
-    参数：
-        scores_dict: 所有层的得分
-        target_layer: 要剪枝的层名（string）
-        prune_ratio: 剪枝比例
-        unit_size: 分组单位
-    
-    返回：
-        masks_dict: 所有层的掩码（只有 target_layer 被剪）
-    """
-    masks_dict = {}
-    for layer_name, score_tensor in scores_dict.items():
-        if layer_name != target_layer:
-            # 不剪的层全保留
-            masks_dict[layer_name] = torch.ones_like(score_tensor)
-            continue
-
-        total_weights = score_tensor.numel()
-        if total_weights < unit_size:
-            masks_dict[layer_name] = torch.ones_like(score_tensor)
-            print(f"[{layer_name}] 权重数 {total_weights} < {unit_size}, 不剪枝")
-            continue
-
-        score_flat = score_tensor.view(-1)
-        num_groups = total_weights // unit_size
-        mask_flat = torch.ones_like(score_flat)
-
-        for g in range(num_groups):
-            start = g * unit_size
-            end = start + unit_size
-            group_scores = score_flat[start:end]
-
-            prune_num = int(unit_size * prune_ratio)
-            if prune_num == 0:
-                continue
-
-            prune_indices = torch.topk(group_scores, prune_num, largest=False).indices
-            mask_flat[start:end][prune_indices] = 0
-
-        mask = mask_flat.view(score_tensor.shape)
-        masks_dict[layer_name] = mask
-
-        kept = mask.sum().item()
-        print(f"[{layer_name}] 只剪此层，共{total_weights}个参数，保留{kept}个")
-
-    return masks_dict
-
-def compute_current_sparsity_paper(epoch, start_epoch, end_epoch, final_sparsity, initial_sparsity=0.0):
-    """
-    论文逐步剪枝非线性三次幂调度公式
-    s_t = s_f + (s_i - s_f) * (1 - (t - t0)/(nΔt))^3
-    """
-    if epoch < start_epoch:
+def compute_current_sparsity_step(step, start_step, end_step, final_sparsity, initial_sparsity=0.0):
+    if step < start_step:
         return initial_sparsity
-    elif epoch > end_epoch:
+    elif step > end_step:
         return final_sparsity
     else:
-        progress = (epoch - start_epoch) / (end_epoch - start_epoch)  # 0~1
+        progress = (step - start_step) / (end_step - start_step)
         return final_sparsity + (initial_sparsity - final_sparsity) * (1 - progress) ** 3
     
-def update_masks_groupwise_64(model, scores_dict, epoch, start_epoch, end_epoch, final_sparsity, existing_masks_dict=None):
-    """
-    Wanda++ group-wise 64元素剪枝（非线性逐步稀疏）
 
-    参数:
-        model: PyTorch模型
-        scorer: WandaPlusElementwiseScorer实例，包含累积分数
-        epoch: 当前训练epoch
-        start_epoch: 剪枝开始epoch
-        end_epoch: 剪枝结束epoch
-        final_sparsity: 目标稀疏率
-        existing_masks_dict: 上轮掩码（用于累积剪枝）
 
-    返回:
-        masks_dict: 当前epoch掩码字典 {层名: mask_tensor}
-    """
-    # -------- 预热阶段：不进行剪枝 --------
-    WARMUP_EPOCHS = 5  # 预热epoch数
-    TOTAL_EPOCHS = 100  # 训练总 epoch，若不同可按需修改
-    STAGE_COUNT = 3
+def reset_optimizer_state_for_pruned_weights(optimizer, masks_dict):
+    """彻底重置被剪枝权重的优化器状态，确保它们不会影响训练。
     
-    if epoch < WARMUP_EPOCHS:
-        # 预热期间不剪枝，返回全1掩码或保持现有掩码
-        if existing_masks_dict is not None:
-            return existing_masks_dict
-        else:
-            # 创建全1掩码
-            masks_dict = {}
-            for name, module in model.named_modules():
-                if isinstance(module, nn.Conv2d):
-                    masks_dict[name] = torch.ones_like(module.weight)
-            return masks_dict
-
-    # -------- 多阶段非线性稀疏率调度（阶段平均分配） --------
-    # 调整后的阶段计算（减去预热期）
-    adjusted_epoch = epoch - WARMUP_EPOCHS
-    adjusted_total = TOTAL_EPOCHS - WARMUP_EPOCHS
-    STAGE_LENGTH = adjusted_total // STAGE_COUNT  # ≈31
-
-    stage_targets = [0.5, 0.65, 0.75]  # 各阶段目标稀疏率
-
-    # 计算当前所处阶段 idx (0,1,2)
-    stage_idx = min(adjusted_epoch // STAGE_LENGTH, STAGE_COUNT - 1)
-    stage_start = stage_idx * STAGE_LENGTH + WARMUP_EPOCHS  # 加回预热期
-    # 处理最后一个阶段长度可能略长的情况
-    if stage_idx == STAGE_COUNT - 1:
-        stage_end = TOTAL_EPOCHS
-    else:
-        stage_end = stage_start + STAGE_LENGTH
-
-    ramp_len = int((stage_end - stage_start) * 0.7)  # 前 80% 用于过渡
-    ramp_end = stage_start + ramp_len
-
-    prev_target = 0.0 if stage_idx == 0 else stage_targets[stage_idx - 1]
-    target_sparsity = stage_targets[stage_idx]
-
-    # 根据所在位置计算 current_sparsity
-    if epoch < ramp_end:
-        current_sparsity = compute_current_sparsity_paper(
-            epoch=epoch,
-            start_epoch=stage_start,
-            end_epoch=ramp_end,
-            final_sparsity=target_sparsity,
-            initial_sparsity=prev_target,
-        )
-    else:
-        current_sparsity = target_sparsity
-
-    print(f"Epoch {epoch}: sparsity {current_sparsity} (stage {stage_idx + 1})")
-
-    # -------- 锁定阶段：若位于阶段后 20%，保持前一轮掩码 --------
-    if epoch >= ramp_end and existing_masks_dict is not None:
-        return existing_masks_dict
-
-    masks_dict = {}
-
-    unit_size = 64
-
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Conv2d) and name in scores_dict:
-            score = scores_dict[name].to(module.weight.device)
-            weight = module.weight.data
-
-            flat_score = score.view(-1)
-            num_units = flat_score.numel() // unit_size
-
-            if num_units == 0:
-                # 权重数量不足一组，跳过
-                continue
-
-            flat_score = flat_score[:num_units * unit_size]  # 截断
-            grouped_score = flat_score.view(num_units, unit_size).mean(dim=1)
-
-            # 保持已有为0的组不恢复
-            if existing_masks_dict is not None and name in existing_masks_dict:
-                prev_mask = existing_masks_dict[name].view(-1)[:num_units * unit_size]
-                prev_mask = prev_mask.view(num_units, unit_size)
-                valid_mask = (prev_mask.mean(dim=1) > 0).float()
-                grouped_score *= valid_mask
-
-            # top-k组保留
-            k = max(1, int((1 - current_sparsity) * num_units))
-            if k == 0:
-                # 防止k=0导致错误，全部剪除
-                group_mask = torch.zeros_like(grouped_score)
-            else:
-                topk_val, _ = torch.topk(grouped_score, k, sorted=False)
-                threshold = topk_val[-1]
-                group_mask = (grouped_score >= threshold).float()
-
-            # 展开mask至每个元素
-            group_mask = group_mask.view(-1, 1).expand(-1, unit_size)
-
-            # 处理尾部剩余元素（如果存在）
-            tail = score.numel() % unit_size
-            if tail > 0:
-                tail_mask = torch.ones(tail, device=score.device)
-                full_mask = torch.cat([group_mask.reshape(-1), tail_mask], dim=0)
-            else:
-                full_mask = group_mask.reshape(-1)
-
-            full_mask = full_mask.view_as(score)
-            module.weight.data *= full_mask
-            masks_dict[name] = full_mask
-
-    return masks_dict
-
-def update_masks_groupwise_64_v2(model, scores_dict, epoch, target_sparsity=0.75):
-    """
-    Wanda++ group-wise 64元素剪枝（一次性剪枝版本）
-    
-    在预热期结束后（第5个epoch），一次性剪枝到目标稀疏率，
-    后续epoch直接复用该掩码，不再重新计算。
-
-    参数:
-        model: PyTorch模型
-        scores_dict: 得分字典
-        epoch: 当前训练epoch
-        target_sparsity: 目标稀疏率，默认0.75
-
-    返回:
-        masks_dict: 掩码字典 {层名: mask_tensor}，或None（预热期）
-    """
-    
-    print(f"Epoch {epoch}: 执行一次性剪枝，目标稀疏率 {target_sparsity}")
-    
-    masks_dict = {}
-    unit_size = 64
-
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Conv2d) and name in scores_dict:
-            score = scores_dict[name].to(module.weight.device)
-            weight = module.weight.data
-
-            flat_score = score.view(-1)
-            num_units = flat_score.numel() // unit_size
-
-            if num_units == 0:
-                # 权重数量不足一组，跳过剪枝
-                masks_dict[name] = torch.ones_like(score)
-                continue
-
-            flat_score = flat_score[:num_units * unit_size]  # 截断
-            grouped_score = flat_score.view(num_units, unit_size).mean(dim=1)
-
-            # 计算需要保留的组数
-            k = max(1, int((1 - target_sparsity) * num_units))
-            
-            if k >= num_units:
-                # 保留所有组
-                group_mask = torch.ones_like(grouped_score)
-            else:
-                # top-k组保留
-                topk_val, _ = torch.topk(grouped_score, k, sorted=False)
-                threshold = topk_val[-1]
-                group_mask = (grouped_score >= threshold).float()
-
-            # 展开mask至每个元素
-            group_mask = group_mask.view(-1, 1).expand(-1, unit_size)
-
-            # 处理尾部剩余元素（如果存在）
-            tail = score.numel() % unit_size
-            if tail > 0:
-                tail_mask = torch.ones(tail, device=score.device)
-                full_mask = torch.cat([group_mask.reshape(-1), tail_mask], dim=0)
-            else:
-                full_mask = group_mask.reshape(-1)
-
-            full_mask = full_mask.view_as(score)
-            masks_dict[name] = full_mask
-            
-            # 统计剪枝结果
-            kept = full_mask.sum().item()
-            total = full_mask.numel()
-            actual_sparsity = 1 - kept / total
-            print(f"[{name}] 总参数:{total}, 保留:{kept}, 实际稀疏率:{actual_sparsity:.3f}")
-
-    return masks_dict
-
-def apply_mask_to_grads_and_state(optimizer, masks_dict):
-    """在 optimizer.step() 前屏蔽已剪枝权重的梯度和动量。
-
-    新版实现 **不依赖 `param_name`**，而是按以下顺序寻找掩码：
-
-    1. 先用参数对象本身作为 key（推荐：构造 masks_dict 时直接用 param）
-    2. 再退回旧版的 name 键，保证向后兼容
+    这个函数应该在剪枝后立即调用，确保被剪枝的权重完全停止更新。
     
     参数：
         optimizer: 优化器
@@ -477,9 +149,6 @@ def apply_mask_to_grads_and_state(optimizer, masks_dict):
 
     for group in optimizer.param_groups:
         for p in group["params"]:
-            if p.grad is None:
-                continue
-
             # 优先使用参数对象本身作为 key
             mask = masks_dict.get(p, None)
 
@@ -493,15 +162,29 @@ def apply_mask_to_grads_and_state(optimizer, masks_dict):
                 continue  # 找不到对应 mask，跳过
 
             mask = mask.to(p.device)
+            zero_mask = (mask == 0)  # 被剪枝的位置
 
-            # ① 屏蔽梯度
-            p.grad.mul_(mask)
+            if not zero_mask.any():
+                continue  # 没有剪枝位置，跳过
 
-            # ② 屏蔽动量 / EMA 等状态
+            # 重置优化器状态中被剪枝的位置
             state = optimizer.state[p]
-            for key in ("exp_avg", "exp_avg_sq", "momentum_buffer"):
-                if key in state:
-                    state[key].mul_(mask)
+            
+            # 对于Adam优化器
+            if "exp_avg" in state:
+                state["exp_avg"][zero_mask] = 0.0
+            if "exp_avg_sq" in state:
+                state["exp_avg_sq"][zero_mask] = 0.0
+            
+            # 对于SGD优化器
+            if "momentum_buffer" in state:
+                state["momentum_buffer"][zero_mask] = 0.0
+            
+            # 对于其他可能的优化器状态
+            for key in state:
+                if isinstance(state[key], torch.Tensor) and state[key].shape == p.shape:
+                    state[key][zero_mask] = 0.0
+
 
 def compute_sparsity(masks_dict: dict):
     total = 0
@@ -511,206 +194,315 @@ def compute_sparsity(masks_dict: dict):
         zero += (mask == 0).sum().item()
     return zero / total
 
-def prune_by_weight_magnitude_groupwise_64(model: nn.Module, epoch, start_epoch, end_epoch, final_sparsity, unit_size: int = 64, existing_masks_dict: Optional[Dict[str, torch.Tensor]] = None):
-    """按照权重绝对值做 group-wise 64 剪枝。
 
-    参数:
-        model:     PyTorch 模型（遍历其中 Conv2d 层）
-        prune_ratio: 目标稀疏率 (0~1)，例如 0.5 表示剪掉 50% 的 group
-        unit_size: 每个剪枝单元内包含的元素个数，默认 64
-        existing_masks_dict:  前一轮掩码（继续在其基础上裁剪），可为 None
-
-    返回:
-        masks_dict: dict[layer_name] = mask_tensor (0/1)
-    """
-    prune_ratio = compute_current_sparsity_paper(epoch, start_epoch, end_epoch, final_sparsity)
-    assert 0.0 <= prune_ratio <= 1.0, "prune_ratio 应在 0~1 之间"
-    masks_dict: Dict[str, torch.Tensor] = {}
-
-    for name, module in model.named_modules():
-        if not isinstance(module, nn.Conv2d):
-            continue
-
-        weight = module.weight.detach()
-        abs_weight = weight.abs()
-        total_elems = abs_weight.numel()
-
-        # 不足一个 group 直接跳过
-        if total_elems < unit_size:
-            masks_dict[name] = torch.ones_like(weight, dtype=weight.dtype, device=weight.device)
-            continue
-
-        # 展平成 1-D，并取整批 group（尾部不足 unit_size 的元素暂时不参与排序，将在后面直接保留）
-        flat_w = abs_weight.view(-1)
-        num_full_groups = flat_w.numel() // unit_size
-        head_flat = flat_w[: num_full_groups * unit_size]
-        tail_flat = flat_w[num_full_groups * unit_size :]
-
-        # 计算每个 group 的平均绝对值
-        grouped = head_flat.view(num_full_groups, unit_size)
-        group_mean = grouped.mean(dim=1)
-
-        # 保证已有为 0 的 group 不被复活
-        if existing_masks_dict is not None and name in existing_masks_dict:
-            prev_mask = existing_masks_dict[name].view(-1)[: num_full_groups * unit_size]
-            prev_mask = prev_mask.view(num_full_groups, unit_size)
-            valid_mask = (prev_mask.mean(dim=1) > 0).float()  # 0 表示已剪掉
-            group_mean = group_mean * valid_mask  # 已经被剪的 group 均值变 0，保证继续保持 0
-
-        # 计算需保留的 group 数量
-        k_keep = int((1.0 - prune_ratio) * num_full_groups)
-        k_keep = max(k_keep, 1)
-
-        if k_keep == 0:
-            group_keep_mask = torch.zeros_like(group_mean)
-        else:
-            top_vals, _ = torch.topk(group_mean, k_keep, largest=True, sorted=False)
-            threshold = top_vals.min()
-            group_keep_mask = (group_mean >= threshold).float()
-
-        # 再与 valid_mask 取交集，彻底防止已剪掉的 group 被“复活”
-        if existing_masks_dict is not None and name in existing_masks_dict:
-            group_keep_mask = group_keep_mask * valid_mask
-
-        # 展开到元素级别
-        expanded_mask = group_keep_mask.view(-1, 1).expand(-1, unit_size).reshape(-1)
-
-        # 将尾部不足 unit_size 的元素全部保留
-        if tail_flat.numel() > 0:
-            tail_mask = torch.ones_like(tail_flat)
-            full_mask_flat = torch.cat([expanded_mask, tail_mask], dim=0)
-        else:
-            full_mask_flat = expanded_mask
-
-        full_mask = full_mask_flat.view_as(weight).to(weight.device)
-        masks_dict[name] = full_mask
-
-    return masks_dict
-
-
-
-import os
-def save_pruned_model(model, masks_dict, filename, ema=None):
-    if ema:
-        model = deepcopy(ema)
-        print('====================copy to model')
-    apply_mask_to_model_weights(model, masks_dict)
-    save_path = os.path.join('/home/zhengxiuzhang/ultralytics-main/pruned_model', filename)
-    torch.save(model.state_dict(), save_path)
-
-def update_masks_and_clear_scorer(self, scorer, start_epoch, end_epoch, final_sparsity, previous_masks_dict):
+def update_masks_and_clear_scorer(self, scorer, step, total_steps, prune_steps, final_sparsity, previous_masks_dict, prune_fre=100):
     """先按权重幅度做一次 group-wise 64 剪枝，再按得分更新 mask，最后清空 scorer。
 
     这样便可在 trainer 中只保留一次函数调用，减少重复代码。
     """
+    # 检查是否需要更新mask（每prune_fre步更新一次）
+    if step % prune_fre != 0 or step >= total_steps:
+        return previous_masks_dict
+    
+    # 计算当前稀疏率
+    if step < prune_steps:
+        current_sparsity = compute_current_sparsity_step(step, 0, prune_steps, final_sparsity, initial_sparsity=0.0)
+    else:
+        current_sparsity = final_sparsity
+    
+    print(f"[Step Prune] Step {step}: sparsity {current_sparsity:.4f}")
+    
     # 2. 根据 Wanda++ 得分进一步更新 mask（不"复活"已剪掉的权重）
-    scores_dict = scorer.compute_final_scores()
-    masks = update_masks_groupwise_64(
-        model=self.model.module,
-        scores_dict=scores_dict,
-        epoch=self.epoch,
-        start_epoch=start_epoch,
-        end_epoch=end_epoch,
-        final_sparsity=final_sparsity,
-        existing_masks_dict=previous_masks_dict,
-    )
-
-    # 3. 清理 scorer 相关缓存，便于下一 epoch 重新累积
-    scorer.scores_sum.clear()
-    scorer.forward_acts_sum.clear()
-    scorer.forward_acts_count.clear()
-
+    if self.args.prune_method == 'wanda':
+        scores_dict = scorer.compute_final_scores()
+        masks = update_masks_asic_style(self.model.module, scores_dict, step, total_steps, prune_steps, current_sparsity, group_size_value=64, dtype='int8', existing_masks_dict=previous_masks_dict)
+        scorer.scores_sum.clear()
+        scorer.forward_acts_sum.clear()
+        scorer.forward_acts_count.clear()
+    elif self.args.prune_method == 'abs':
+        masks = update_masks_asic_style_magnitude(self.model.module, step, total_steps, prune_steps, current_sparsity, group_size_value=64, dtype='int8', existing_masks_dict=previous_masks_dict)
+    else:
+        masks = None
     return masks
 
 import math
 from typing import List, Tuple
 
-def adjust_phase_lr(
-        epoch: int,
-        optimizer,
-        total_epochs: int = 100,      # 训练总 epoch
-        prune_epochs: int = 70,       # 剪枝期（含微调）长度
-        plateau_lr: float = 2e-3,     # 初始 LR（剪枝初期）
-        ft_peak_lr: float = 7e-4,     # 微调起始 LR（剪枝后期末）
-        ft_min_lr: float = 1e-4,      # 微调最低 LR
-):
-    """
-    新策略：
-    剪枝阶段：线性下降学习率（plateau_lr -> ft_peak_lr）
-    微调阶段：从 ft_peak_lr 开始余弦退火到 ft_min_lr
-    """
 
-    if epoch < prune_epochs:
-        # 阶段1：剪枝阶段，线性下降 LR
-        progress = epoch / max(1, prune_epochs)
-        lr = plateau_lr + (ft_peak_lr - plateau_lr) * progress  # 注意：ft_peak_lr < plateau_lr
+def adjust_lr_by_step(batch_size,step, optimizer, total_steps, base_lr=5e-4, min_lr=5e-6):
+    prune_steps = int(total_steps * 0.8)
+    base_lr=base_lr*batch_size/8
+    min_lr=min_lr*batch_size/8
+    if step < prune_steps:
+        lr = base_lr
     else:
-        # 阶段2：微调阶段，余弦退火
-        progress = (epoch - prune_epochs) / max(1, total_epochs - prune_epochs)
-        lr = ft_min_lr + 0.5 * (ft_peak_lr - ft_min_lr) * (1 + math.cos(math.pi * progress))
-
+        decay_progress = (step - prune_steps) / (total_steps - prune_steps)
+        lr = base_lr - (base_lr - min_lr) * decay_progress
     for pg in optimizer.param_groups:
         pg["lr"] = lr
 
-def adjust_phase_lr_v2(
-    epoch: int,
-    optimizer,
-    *,
-    total_epochs: int = 100,
-    warmup_epochs: int = 5,
-    stage_count: int = 3,
-    base_batch: int = 8,
-    current_batch: int = 32,
-    base_lr: float = 1e-3,
-    min_lr: float = 1e-5,
-):
+
+import numpy as np
+
+def np_topk(weight, k, axis=1):
     """
-    多阶段学习率策略（批量缩放版，配合分段剪枝）
-
-    1. **预热阶段（前5个epoch）**：学习率从0线性上升到plateau_lr
-    2. **每个剪枝阶段（3段）**：
-       - 阶段内前80%：学习率保持常数plateau_lr
-       - 阶段内后20%：学习率从plateau_lr线性衰减到ft_min_lr
-
-    按 *线性缩放原则*：`lr ∝ batch_size / base_batch`。
+    perform topK based on np.argsort
+    :param weight: to be sorted
+    :param k: select and sort the top K items
+    :param axis: dimension to be sorted.
+    :return:
     """
-
-    # 计算缩放后的学习率上下限
-    scale = current_batch / base_batch
-    plateau_lr = base_lr * scale       
-    ft_min_lr = min_lr * scale         
-
-    # 基础参数计算
-    stage_length = (total_epochs - warmup_epochs) // stage_count
+    full_sort = np.argsort(weight, axis=axis)
     
-    if epoch < warmup_epochs:
-        # 1. 预热阶段：线性增加到plateau_lr
-        progress = epoch / warmup_epochs
-        lr = progress * plateau_lr
-        
+    # 处理不同维度的情况
+    if weight.ndim == 1:
+        # 1维数组，直接反转
+        full_sort = full_sort[::-1]
+    elif axis == 0:
+        # 2维数组，axis=0时反转行
+        full_sort = full_sort[::-1, :]
     else:
-        # 2. 确定当前所处阶段
-        adjusted_epoch = epoch - warmup_epochs
-        stage_idx = min(adjusted_epoch // stage_length, stage_count - 1)
-        stage_start = stage_idx * stage_length + warmup_epochs
-        
-        # 处理最后一个阶段可能略长的情况
-        if stage_idx == stage_count - 1:
-            stage_end = total_epochs
-        else:
-            stage_end = stage_start + stage_length
-            
-        # 计算阶段内80%位置
-        ramp_len = int((stage_end - stage_start) * 0.7)
-        ramp_end = stage_start + ramp_len
-        
-        if epoch < ramp_end:
-            # 阶段内前80%：保持恒定plateau_lr
-            lr = plateau_lr
-        else:
-            # 阶段内后20%：线性衰减到最小学习率
-            decay_progress = (epoch - ramp_end) / (stage_end - ramp_end)
-            lr = plateau_lr - (plateau_lr - ft_min_lr) * decay_progress
+        # 2维数组，axis=1时反转列
+        full_sort = full_sort[:, ::-1]
+    
+    return full_sort.take(np.arange(k), axis=axis)
 
-    for pg in optimizer.param_groups:
-        pg["lr"] = lr
+
+def _block_sparsity_balance_inchannel(transpose_weight, keep_k):
+    """
+    ASIC风格的块稀疏平衡 - Input Channel版本
+    
+    参数:
+        transpose_weight: 形状为 [H, W, out_ch, group_in_ch] 的权重
+        keep_k: 保留的参数数量
+    
+    返回:
+        mask: 形状与transpose_weight相同的掩码
+    """
+    # 重塑为 [H*W*out_ch, group_in_ch] 以便在input channel维度上操作
+    original_shape = transpose_weight.shape
+    reshape_weight = np.reshape(transpose_weight, [-1, transpose_weight.shape[-1]])
+    
+    
+    # 每个位置(H*W*out_ch)分配相同的保留数量
+    base_k = keep_k // reshape_weight.shape[0]  # 每个位置保留的input channel数
+    remain_k = keep_k % reshape_weight.shape[0]  # 剩余的参数数量
+    
+    
+    if remain_k > 0:
+        # 如果有剩余，前remain_k个位置多保留1个
+        index = np_topk(np.abs(reshape_weight), min(reshape_weight.shape[-1], base_k + 1))
+    else:
+        index = np_topk(np.abs(reshape_weight), min(reshape_weight.shape[-1], base_k))
+    
+    # 构建掩码
+    dim1 = []
+    dim2 = []
+    for i, temp in enumerate(index.tolist()):
+        for j in temp:
+            dim1.append(i)
+            dim2.append(j)
+    
+    mask = np.zeros(reshape_weight.shape)
+    mask[dim1, dim2] = 1
+    
+    # 重塑回原始形状
+    mask = mask.reshape(original_shape)
+    mask = mask.astype(dtype=transpose_weight.dtype)
+    
+    
+    return mask
+
+def update_mask_asic_4d_torch(weight_tensor, keep_k, group_size_value=64, dtype='int8'):
+    """
+    ASIC风格的4D权重剪枝（PyTorch版本）- Input Channel分组
+    
+    参数:
+        weight_tensor: PyTorch张量，形状为 [out_ch, in_ch, H, W]
+        keep_k: 保留的参数数量
+        group_size_value: 组大小，默认64
+        dtype: 数据类型
+    
+    返回:
+        mask: PyTorch张量，与weight_tensor形状相同的掩码
+    """
+    # 转换为numpy进行处理
+    weight = weight_tensor.detach().cpu().numpy()
+    
+    if keep_k >= 1:
+        # 从 [out_ch, in_ch, H, W] 转换为 [H, W, out_ch, in_ch] (将in_ch放到最后)
+        h, w, i, o = weight.shape[2], weight.shape[3], weight.shape[1], weight.shape[0]
+        transpose_weight = np.transpose(weight, [2, 3, 0, 1])  # [H, W, out_ch, in_ch]
+        
+        if transpose_weight.shape[0] == 1 and transpose_weight.shape[1] == 1:
+            # 1x1卷积的情况
+            transpose_weight = np.squeeze(transpose_weight, axis=(0, 1))  # [out_ch, in_ch]
+            
+            # 使用简化的2D处理 - 在input channel维度分组
+            mask = update_mask_asic_2d_inchannel_torch(transpose_weight, keep_k, dtype, group_size_value=group_size_value)
+            mask = np.reshape(mask, [h, w, o, i])
+        else:
+            # 常规卷积的情况 - 在input channel维度分组
+            group_size = group_size_value
+            if dtype in ['bf16', 'bfloat16']:
+                group_size = group_size_value // 2
+            
+            temp1 = transpose_weight.shape[-1] // group_size  # in_ch维度的组数
+            temp2 = transpose_weight.shape[-1] % group_size   # 剩余的in_ch
+            
+            keep_k_1 = int(keep_k * temp1 * group_size / transpose_weight.shape[-1])
+            keep_k_2 = keep_k - keep_k_1
+            
+            mask = np.ones([h, w, o, i])
+            
+            
+            # 处理完整的组 - 在input channel维度
+            if temp1 > 0:
+                for idx in range(temp1):
+                    start_ch = idx * group_size
+                    end_ch = (idx + 1) * group_size
+                    
+                    # 提取当前组: [H, W, out_ch, group_in_ch]
+                    transpose_weight_1 = transpose_weight[:, :, :, start_ch:end_ch]
+                    mask_1 = _block_sparsity_balance_inchannel(transpose_weight_1, keep_k_1 // temp1)
+                    mask[:, :, :, start_ch:end_ch] = mask_1
+            
+            # 处理剩余的通道
+            if temp2 > 0:
+                transpose_weight_2 = transpose_weight[:, :, :, temp1 * group_size:]
+                mask_2 = _block_sparsity_balance_inchannel(transpose_weight_2, keep_k_2)
+                mask[:, :, :, temp1 * group_size:] = mask_2
+        
+        # 转换回原始形状 [out_ch, in_ch, H, W]
+        mask = np.transpose(mask, [2, 3, 0, 1])
+    else:
+        mask = np.zeros_like(weight)
+    
+    # 转换回PyTorch张量
+    return torch.from_numpy(mask).to(weight_tensor.device).type(weight_tensor.dtype)
+
+def update_mask_asic_2d_torch(weight, keep_k, dtype, group_size_value=64):
+    """
+    ASIC风格的2D权重剪枝辅助函数
+    """
+    if keep_k >= 1:
+        # 简化的2D处理逻辑
+        reshape_weight = weight.reshape(-1)
+        index = np_topk(np.abs(reshape_weight), keep_k, axis=0)
+        mask = np.zeros(reshape_weight.shape)
+        mask[index] = 1
+        mask = mask.reshape(weight.shape)
+        mask = mask.astype(weight.dtype)
+    else:
+        mask = np.zeros_like(weight)
+    return mask
+
+def update_mask_asic_2d_inchannel_torch(weight, keep_k, dtype, group_size_value=64):
+    """
+    ASIC风格的2D权重剪枝辅助函数 - Input Channel分组
+    """
+    if keep_k >= 1:
+        # 简化的2D处理逻辑
+        reshape_weight = weight.reshape(-1)
+        index = np_topk(np.abs(reshape_weight), keep_k, axis=0)
+        mask = np.zeros(reshape_weight.shape)
+        mask[index] = 1
+        mask = mask.reshape(weight.shape)
+        mask = mask.astype(weight.dtype)
+    else:
+        mask = np.zeros_like(weight)
+    return mask
+
+def update_masks_asic_style(model, scores_dict, step, total_steps, prune_steps, current_sparsity, group_size_value=64, dtype='int8', existing_masks_dict=None):
+    """
+    ASIC风格的group-wise剪枝（模仿提供的代码逻辑，step级调度）
+
+    参数:
+        model: PyTorch模型
+        scores_dict: Wanda++ 得分字典
+        step: 当前step
+        total_steps: 总step数
+        prune_steps: 剪枝阶段step数（前80%）
+        current_sparsity: 当前稀疏率
+        group_size_value: 组大小，默认64
+        dtype: 数据类型
+        existing_masks_dict: 上轮掩码（用于累积剪枝）
+
+    返回:
+        masks_dict: 当前step掩码字典 {层名: mask_tensor}
+    """
+    # -------- 预热阶段：不进行剪枝 --------
+    if step < 0:
+        if existing_masks_dict is not None:
+            return existing_masks_dict
+        else:
+            masks_dict = {}
+            for name, module in model.named_modules():
+                if isinstance(module, nn.Conv2d):
+                    masks_dict[name] = torch.ones_like(module.weight)
+            return masks_dict
+
+    # -------- 剪枝阶段/微调阶段 --------
+    masks_dict = {}
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d) and name in scores_dict:
+            weight = module.weight.data
+            score = scores_dict[name].to(weight.device)
+            # 保护关键层：完全跳过剪枝
+            # critical_layers = ['model.0.conv', 'model.22.cv2.0.2', 'model.22.cv3.0.2', 'model.22.dfl.conv']
+            critical_layers = ['model.22.dfl.conv']
+            if name in critical_layers:
+                masks_dict[name] = torch.ones_like(weight)
+                continue
+            total_params = weight.numel()
+            keep_k = max(int(total_params * (1.0 - current_sparsity)), 1)
+            mask = update_mask_asic_4d_torch(
+                weight_tensor=score,
+                keep_k=keep_k,
+                group_size_value=group_size_value,
+                dtype=dtype
+            )
+            if existing_masks_dict is not None and name in existing_masks_dict:
+                prev_mask = existing_masks_dict[name]
+                mask = mask * prev_mask
+            module.weight.data *= mask
+            masks_dict[name] = mask
+    return masks_dict
+
+
+def update_masks_asic_style_magnitude(model, step, total_steps, prune_steps, current_sparsity, group_size_value=64, dtype='int8', existing_masks_dict=None):
+    """
+    ASIC风格的group-wise剪枝（基于权重绝对值，step级调度）
+    """
+    if step < 0:
+        if existing_masks_dict is not None:
+            return existing_masks_dict
+        else:
+            masks_dict = {}
+            for name, module in model.named_modules():
+                if isinstance(module, nn.Conv2d):
+                    masks_dict[name] = torch.ones_like(module.weight)
+            return masks_dict
+    masks_dict = {}
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            weight = module.weight.data
+            # critical_layers = ['model.0.conv', 'model.22.cv2.0.2', 'model.22.cv3.0.2', 'model.22.dfl.conv']
+            critical_layers = ['model.22.dfl.conv']
+            if name in critical_layers:
+                masks_dict[name] = torch.ones_like(weight)
+                continue
+            total_params = weight.numel()
+            keep_k = max(int(total_params * (1.0 - current_sparsity)), 1)
+            mask = update_mask_asic_4d_torch(
+                weight_tensor=weight.abs(),
+                keep_k=keep_k,
+                group_size_value=group_size_value,
+                dtype=dtype
+            )
+            if existing_masks_dict is not None and name in existing_masks_dict:
+                prev_mask = existing_masks_dict[name]
+                mask = mask * prev_mask
+            module.weight.data *= mask
+            masks_dict[name] = mask
+    return masks_dict

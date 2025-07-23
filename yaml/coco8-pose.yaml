@@ -1,0 +1,16 @@
+
+# 训练集的相对路径，这里是 path 路径下的 images/train 目录，包含4张训练用图片。
+train: /home/zhengxiuzhang/ultralytics-main/coco-person/images/train2017
+# 验证集的相对路径，这里是 path 路径下的 images/val 目录，包含4张验证用图片。
+val: /home/zhengxiuzhang/ultralytics-main/coco-person/images/val2017
+test:  # test
+ 
+# 关键点的形状，表示有17个关键点，每个关键点有3个维度（通常是x坐标、y坐标和一个表示可见性的标记）。
+kpt_shape: [17, 3]
+# 翻转索引，用于在数据增强（如图像翻转）时调整关键点的顺序。
+flip_idx: [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
+ 
+# 类别名称。
+names:
+  0: person
+ 
